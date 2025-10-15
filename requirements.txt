@@ -1,0 +1,16 @@
+numpy
+pandas
+tifffile
+scikit-image
+scipy
+pillow
+networkx
+imageio
+matplotlib
+# Optional for interactive 3D/4D visualization
+napari[all]
+plotly
+# Optional for legacy HTML viewer
+pyvis
+
+magicgui
