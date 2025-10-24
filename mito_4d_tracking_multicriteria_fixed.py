@@ -46,7 +46,7 @@ python mito_4d_tracking_multicriteria_fixed.py ^
   --export_graph --graph_per_track
 """
 from __future__ import annotations
-import argparse, os, sys
+import argparse, os, sys, json
 from collections import defaultdict
 from typing import Dict, List, Tuple
 import numpy as np
@@ -414,9 +414,57 @@ def main():
                 "bbox_zyx0": r["bbox_zyx0"], "bbox_zyx1": r["bbox_zyx1"],
             })
 
-    objects_df = pd.DataFrame(objects_rows).sort_values(["t","label_id"])
-    links_df   = pd.DataFrame(links_rows).sort_values(["t_from","parent_label","child_label"])
-    matches_df = pd.DataFrame(matches_rows).sort_values(["t_from","parent_label","child_label"])
+    objects_columns = [
+        "t",
+        "label_id",
+        "track_id",
+        "centroid_z_um",
+        "centroid_y_um",
+        "centroid_x_um",
+        "centroid_z_vox",
+        "centroid_y_vox",
+        "centroid_x_vox",
+        "volume_vox",
+        "volume_um3",
+        "r_eq_um",
+        "bbox_zyx0",
+        "bbox_zyx1",
+    ]
+    objects_df = pd.DataFrame(objects_rows, columns=objects_columns)
+    if not objects_df.empty:
+        objects_df = objects_df.sort_values(["t", "label_id"]).reset_index(drop=True)
+
+    links_columns = [
+        "t_from",
+        "t_to",
+        "parent_label",
+        "child_label",
+        "assigned",
+        "cost",
+        "iou",
+        "dist_um",
+        "dvol",
+        "overlap_event_evidence",
+    ]
+    links_df = pd.DataFrame(links_rows, columns=links_columns)
+    if not links_df.empty:
+        links_df = links_df.sort_values(["t_from", "parent_label", "child_label"]).reset_index(drop=True)
+
+    matches_columns = [
+        "t_from",
+        "t_to",
+        "parent_label",
+        "child_label",
+        "parent_track_id",
+        "child_track_id",
+        "cost",
+        "iou",
+        "dist_um",
+        "dvol",
+    ]
+    matches_df = pd.DataFrame(matches_rows, columns=matches_columns)
+    if not matches_df.empty:
+        matches_df = matches_df.sort_values(["t_from", "parent_label", "child_label"]).reset_index(drop=True)
 
     # persistence filtering for events -> create normalized edges tables (no "t:id" strings)
     # map (t,label) -> (track_id, centroids, volume)
@@ -491,8 +539,34 @@ def main():
         else:
             fusion_rows.append(row)
 
-    fission_df = pd.DataFrame(fission_rows).sort_values(["t_from","parent_label","child_label"])
-    fusion_df  = pd.DataFrame(fusion_rows).sort_values(["t_from","parent_label","child_label"])
+    event_columns = [
+        "event",
+        "t_from",
+        "t_to",
+        "parent_label",
+        "child_label",
+        "parent_track_id",
+        "child_track_id",
+        "parent_volume_vox",
+        "child_volume_vox",
+        "parent_centroid_z_um",
+        "parent_centroid_z_vox",
+        "parent_slice_index",
+        "child_centroid_z_um",
+        "child_centroid_z_vox",
+        "child_slice_index",
+    ]
+    fission_df = pd.DataFrame(fission_rows, columns=event_columns)
+    if not fission_df.empty:
+        fission_df = fission_df.sort_values(["t_from", "parent_label", "child_label"]).reset_index(drop=True)
+    else:
+        fission_df = pd.DataFrame(columns=event_columns)
+
+    fusion_df = pd.DataFrame(fusion_rows, columns=event_columns)
+    if not fusion_df.empty:
+        fusion_df = fusion_df.sort_values(["t_from", "parent_label", "child_label"]).reset_index(drop=True)
+    else:
+        fusion_df = pd.DataFrame(columns=event_columns)
 
     # combined edge list for graph building (continuations + events)
     # continuation edges from matches_df where parent_label != -1 (1:1 or appearance)

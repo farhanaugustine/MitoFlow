@@ -7,7 +7,7 @@ Changes vs mito_gui.py:
 - Works on Windows paths with spaces.
 """
 
-import os, sys, threading, subprocess
+import os, sys, threading, subprocess, json
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -184,6 +184,10 @@ class App(tk.Tk):
         self._action_buttons.append(btn)
         btn = ttk.Button(act, text="Open Lineage (HTML)", command=self.open_lineage); btn.pack(side="left", padx=6, pady=6)
         self._action_buttons.append(btn)
+        cfg = ttk.Frame(act)
+        cfg.pack(side="right", padx=6, pady=6)
+        ttk.Button(cfg, text="Load Config", command=self.load_config).pack(side="left", padx=4)
+        ttk.Button(cfg, text="Save Config", command=self.save_config).pack(side="left", padx=4)
 
         self.txt = tk.Text(self, height=16)
         self.txt.pack(fill="both", expand=True, padx=8, pady=8)
@@ -287,6 +291,159 @@ class App(tk.Tk):
             finally:
                 for b, st in zip(btns, saved_states): b['state'] = st
         threading.Thread(target=target, daemon=True).start()
+
+    def _collect_state(self):
+        string_map = {
+            "var_input": self.var_input,
+            "var_outdir": self.var_outdir,
+            "var_axis": self.var_axis,
+            "var_vz": self.var_vz,
+            "var_vy": self.var_vy,
+            "var_vx": self.var_vx,
+            "var_min_size": self.var_min_size,
+            "var_connectivity": self.var_connectivity,
+            "var_iou_thr_event": self.var_iou_thr_event,
+            "var_max_disp_um": self.var_max_disp_um,
+            "var_w_iou": self.var_w_iou,
+            "var_w_dist": self.var_w_dist,
+            "var_w_vol": self.var_w_vol,
+            "var_max_cost": self.var_max_cost,
+            "var_vol_tol": self.var_vol_tol,
+            "var_min_event_persistence": self.var_min_event_persistence,
+            "var_tracker_path": self.var_tracker_path,
+            "var_reporter_path": self.var_reporter_path,
+            "var_viewer_path": self.var_viewer_path,
+            "var_napari_color_by": self.var_napari_color_by,
+            "var_napari_point_size": self.var_napari_point_size,
+            "var_napari_text_size": self.var_napari_text_size,
+            "var_napari_edge_width": self.var_napari_edge_width,
+            "var_napari_event_size": self.var_napari_event_size,
+            "var_crop_rz": self.var_crop_rz,
+            "var_crop_ry": self.var_crop_ry,
+            "var_crop_rx": self.var_crop_rx,
+            "var_frames_before": self.var_frames_before,
+            "var_frames_after": self.var_frames_after,
+            "var_max_events": self.var_max_events,
+        }
+        bool_map = {
+            "flag_save_pngs": self.flag_save_pngs,
+            "flag_save_labels": self.flag_save_labels,
+            "flag_napari": self.flag_napari,
+            "flag_show_fis": self.flag_show_fis,
+            "flag_show_fus": self.flag_show_fus,
+            "flag_save_parquet": self.flag_save_parquet,
+            "flag_export_graph": self.flag_export_graph,
+            "flag_graph_per_track": self.flag_graph_per_track,
+            "flag_make_gifs": self.flag_make_gifs,
+            "flag_render_lineage": self.flag_render_lineage,
+            "flag_viewer_prefer_edges": self.flag_viewer_prefer_edges,
+            "flag_napari_show_ids": self.flag_napari_show_ids,
+        }
+        return {
+            "strings": {key: var.get() for key, var in string_map.items()},
+            "bools": {key: bool(var.get()) for key, var in bool_map.items()},
+        }
+
+    @staticmethod
+    def _coerce_bool(value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def _apply_state(self, state: dict):
+        if not isinstance(state, dict):
+            return
+        string_map = {
+            "var_input": self.var_input,
+            "var_outdir": self.var_outdir,
+            "var_axis": self.var_axis,
+            "var_vz": self.var_vz,
+            "var_vy": self.var_vy,
+            "var_vx": self.var_vx,
+            "var_min_size": self.var_min_size,
+            "var_connectivity": self.var_connectivity,
+            "var_iou_thr_event": self.var_iou_thr_event,
+            "var_max_disp_um": self.var_max_disp_um,
+            "var_w_iou": self.var_w_iou,
+            "var_w_dist": self.var_w_dist,
+            "var_w_vol": self.var_w_vol,
+            "var_max_cost": self.var_max_cost,
+            "var_vol_tol": self.var_vol_tol,
+            "var_min_event_persistence": self.var_min_event_persistence,
+            "var_tracker_path": self.var_tracker_path,
+            "var_reporter_path": self.var_reporter_path,
+            "var_viewer_path": self.var_viewer_path,
+            "var_napari_color_by": self.var_napari_color_by,
+            "var_napari_point_size": self.var_napari_point_size,
+            "var_napari_text_size": self.var_napari_text_size,
+            "var_napari_edge_width": self.var_napari_edge_width,
+            "var_napari_event_size": self.var_napari_event_size,
+            "var_crop_rz": self.var_crop_rz,
+            "var_crop_ry": self.var_crop_ry,
+            "var_crop_rx": self.var_crop_rx,
+            "var_frames_before": self.var_frames_before,
+            "var_frames_after": self.var_frames_after,
+            "var_max_events": self.var_max_events,
+        }
+        bool_map = {
+            "flag_save_pngs": self.flag_save_pngs,
+            "flag_save_labels": self.flag_save_labels,
+            "flag_napari": self.flag_napari,
+            "flag_show_fis": self.flag_show_fis,
+            "flag_show_fus": self.flag_show_fus,
+            "flag_save_parquet": self.flag_save_parquet,
+            "flag_export_graph": self.flag_export_graph,
+            "flag_graph_per_track": self.flag_graph_per_track,
+            "flag_make_gifs": self.flag_make_gifs,
+            "flag_render_lineage": self.flag_render_lineage,
+            "flag_viewer_prefer_edges": self.flag_viewer_prefer_edges,
+            "flag_napari_show_ids": self.flag_napari_show_ids,
+        }
+        for key, value in state.get("strings", {}).items():
+            var = string_map.get(key)
+            if var is not None:
+                var.set("" if value is None else str(value))
+        for key, value in state.get("bools", {}).items():
+            var = bool_map.get(key)
+            if var is not None:
+                var.set(self._coerce_bool(value))
+
+    def save_config(self):
+        path = filedialog.asksaveasfilename(
+            title="Save configuration",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        state = self._collect_state()
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(state, fh, indent=2)
+            self._log(f"Saved config to {path}\n")
+            messagebox.showinfo("Config", f"Configuration saved to\n{path}")
+        except Exception as exc:
+            self._log(f"[EXCEPTION] Failed to save config: {exc}\n")
+            messagebox.showerror("Config", f"Could not save configuration:\n{exc}")
+
+    def load_config(self):
+        path = filedialog.askopenfilename(
+            title="Load configuration",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                state = json.load(fh)
+            self._apply_state(state)
+            self._log(f"Loaded config from {path}\n")
+            messagebox.showinfo("Config", f"Configuration loaded from\n{path}")
+        except Exception as exc:
+            self._log(f"[EXCEPTION] Failed to load config: {exc}\n")
+            messagebox.showerror("Config", f"Could not load configuration:\n{exc}")
 
     def run_tracking(self):
         if not self.var_input.get() or not self.var_outdir.get():

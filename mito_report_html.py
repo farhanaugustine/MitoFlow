@@ -38,6 +38,7 @@ import imageio.v2 as imageio
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from pandas.errors import EmptyDataError
 
 def parse_axis(axis: str) -> Tuple[int,int,int,int]:
     axis = axis.lower()
@@ -86,6 +87,20 @@ def ensure_dir(p):
     os.makedirs(p, exist_ok=True)
     return p
 
+def read_csv_safe(path: str, columns: list[str] | None = None) -> pd.DataFrame:
+    if not path or not os.path.exists(path):
+        return pd.DataFrame(columns=columns or [])
+    try:
+        df = pd.read_csv(path)
+    except EmptyDataError:
+        return pd.DataFrame(columns=columns or [])
+    if columns:
+        missing = [col for col in columns if col not in df.columns]
+        for col in missing:
+            df[col] = np.nan
+        df = df.reindex(columns=columns)
+    return df
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
@@ -121,10 +136,20 @@ def main():
         print("Missing objects.csv or events edges in --outdir", file=sys.stderr)
         sys.exit(3)
 
-    objects = pd.read_csv(objects_path)
-    fission = pd.read_csv(fiss_path) if os.path.exists(fiss_path) else pd.DataFrame(columns=[])
-    fusion  = pd.read_csv(fus_path)  if os.path.exists(fus_path)  else pd.DataFrame(columns=[])
-    edges_all = pd.read_csv(edges_all_path) if os.path.exists(edges_all_path) else pd.DataFrame(columns=[])
+    object_columns = ["t", "label_id", "track_id", "centroid_z_um", "centroid_y_um", "centroid_x_um",
+                      "centroid_z_vox", "centroid_y_vox", "centroid_x_vox"]
+    event_columns = [
+        "event", "t_from", "t_to", "parent_label", "child_label",
+        "parent_track_id", "child_track_id",
+        "parent_volume_vox", "child_volume_vox",
+        "parent_centroid_z_um", "parent_centroid_z_vox", "parent_slice_index",
+        "child_centroid_z_um", "child_centroid_z_vox", "child_slice_index"
+    ]
+
+    objects = read_csv_safe(objects_path, object_columns)
+    fission = read_csv_safe(fiss_path, event_columns)
+    fusion = read_csv_safe(fus_path, event_columns)
+    edges_all = read_csv_safe(edges_all_path)
 
     # Basic stats
     n_frames = T
