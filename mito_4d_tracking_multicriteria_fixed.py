@@ -22,7 +22,7 @@ Key features
   * Normalized event edges in events_fission_edges.csv / events_fusion_edges.csv (numeric columns; no "t:id" strings)
   * Combined edge list (continuations + events) in edges_all.csv
   * Optional Parquet mirrors (use --save_parquet)
-- Summary CSVs per frame (`events_per_zstack.csv`) and per slice (`events_per_slice.csv`)
+- Summary CSVs per frame (`events_per_t.csv`), per time/slice (`events_per_slice.csv`), and per slice across time (`events_per_z.csv`)
 - Graph exports (use --export_graph):
   * Whole-graph GraphML and DOT
   * Optional per-track subgraphs
@@ -583,21 +583,21 @@ def main():
         events_all = pd.DataFrame(columns=["event", "t_from", "t_to"])
 
     if not events_all.empty:
-        per_zstack_counts = events_all.groupby(["t_to", "event"]).size().unstack(fill_value=0)
+        per_t_counts = events_all.groupby(["t_to", "event"]).size().unstack(fill_value=0)
     else:
-        per_zstack_counts = pd.DataFrame()
+        per_t_counts = pd.DataFrame()
     for col in ("fission", "fusion"):
-        if col not in per_zstack_counts:
-            per_zstack_counts[col] = 0
-    per_zstack_df = per_zstack_counts.reset_index().rename(columns={"t_to": "t", "fission": "fission_count", "fusion": "fusion_count"})
-    if per_zstack_df.empty:
-        per_zstack_df = pd.DataFrame({"t": [], "fission_count": [], "fusion_count": [], "total_events": []})
+        if col not in per_t_counts:
+            per_t_counts[col] = 0
+    per_t_df = per_t_counts.reset_index().rename(columns={"t_to": "t", "fission": "fission_count", "fusion": "fusion_count"})
+    if per_t_df.empty:
+        per_t_df = pd.DataFrame({"t": [], "fission_count": [], "fusion_count": [], "total_events": []})
     else:
-        per_zstack_df["total_events"] = per_zstack_df["fission_count"] + per_zstack_df["fusion_count"]
+        per_t_df["total_events"] = per_t_df["fission_count"] + per_t_df["fusion_count"]
     all_frames = pd.DataFrame({"t": np.arange(T, dtype=int)})
-    per_zstack_df = all_frames.merge(per_zstack_df, on="t", how="left").fillna(0)
+    per_t_df = all_frames.merge(per_t_df, on="t", how="left").fillna(0)
     for col in ["fission_count", "fusion_count", "total_events"]:
-        per_zstack_df[col] = per_zstack_df[col].astype(int)
+        per_t_df[col] = per_t_df[col].astype(int)
 
     if not events_all.empty and "child_slice_index" in events_all.columns:
         per_slice_events = events_all.dropna(subset=["child_slice_index"]).copy()
@@ -624,6 +624,30 @@ def main():
     else:
         per_slice_df = pd.DataFrame({"t": [], "slice_index": [], "slice_z_um": [], "fission_count": [], "fusion_count": [], "total_events": []})
 
+    if not events_all.empty and "child_slice_index" in events_all.columns:
+        per_z_events = events_all.dropna(subset=["child_slice_index"]).copy()
+        per_z_events = per_z_events[per_z_events["child_slice_index"] >= 0]
+        if per_z_events.empty:
+            per_z_df = pd.DataFrame({"slice_index": [], "slice_z_um": [], "fission_count": [], "fusion_count": [], "total_events": []})
+        else:
+            per_z_events["child_slice_index"] = per_z_events["child_slice_index"].astype(int)
+            per_z_counts = per_z_events.groupby(["child_slice_index", "event"]).size().unstack(fill_value=0)
+            for col in ("fission", "fusion"):
+                if col not in per_z_counts:
+                    per_z_counts[col] = 0
+            per_z_df = per_z_counts.reset_index().rename(columns={
+                "child_slice_index": "slice_index",
+                "fission": "fission_count",
+                "fusion": "fusion_count"
+            })
+            per_z_df["slice_z_um"] = per_z_df["slice_index"] * vz
+            per_z_df["total_events"] = per_z_df["fission_count"] + per_z_df["fusion_count"]
+            per_z_df = per_z_df.sort_values(["slice_index"]).reset_index(drop=True)
+            for col in ["fission_count", "fusion_count", "total_events"]:
+                per_z_df[col] = per_z_df[col].astype(int)
+    else:
+        per_z_df = pd.DataFrame({"slice_index": [], "slice_z_um": [], "fission_count": [], "fusion_count": [], "total_events": []})
+
     # --------------------- save tables ---------------------
     os.makedirs(args.outdir, exist_ok=True)
     def save(df: pd.DataFrame, name: str):
@@ -639,11 +663,12 @@ def main():
     p_fiss    = save(fission_df, "events_fission_edges")
     p_fus     = save(fusion_df,  "events_fusion_edges")
     p_edges   = save(edges_all,  "edges_all")
-    p_zstack  = save(per_zstack_df, "events_per_zstack")
+    p_t       = save(per_t_df, "events_per_t")
     p_slice   = save(per_slice_df, "events_per_slice")
+    p_z       = save(per_z_df, "events_per_z")
 
     print("Saved:")
-    for p in [p_objects, p_links, p_matches, p_fiss, p_fus, p_edges, p_zstack, p_slice]:
+    for p in [p_objects, p_links, p_matches, p_fiss, p_fus, p_edges, p_t, p_slice, p_z]:
         print("  ", p)
 
     if args.save_labels:
