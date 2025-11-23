@@ -44,6 +44,10 @@ python mito_4d_tracking_multicriteria_fixed.py ^
   --outdir results_plus ^
   --save_pngs --napari --napari_show_fission --napari_show_fusion ^
   --export_graph --graph_per_track
+
+Updates
+-------
+- Exports Z-slice indices in event tables for easier manual validation.
 """
 from __future__ import annotations
 import argparse, os, sys, json
@@ -200,16 +204,12 @@ def hungarian_1to1(df_cand: pd.DataFrame) -> pd.DataFrame:
 def detect_events(df_cand: pd.DataFrame,
                   props_t: pd.DataFrame,
                   props_tp1: pd.DataFrame,
-                  assigned_pairs: set[Tuple[int, int]],
                   iou_thr_event: float,
                   vol_tol: float) -> List[dict]:
     events = []
     P = props_t.set_index("label_id")
     C = props_tp1.set_index("label_id")
     evidence = df_cand[df_cand["overlap_event_evidence"]]
-    assigned_pairs = {(int(p), int(c)) for (p, c) in assigned_pairs} if assigned_pairs else set()
-    assigned_parents = {p for (p, _) in assigned_pairs}
-    assigned_children = {c for (_, c) in assigned_pairs}
 
     def _vol(df, idx, column):
         if column in df.columns:
@@ -218,8 +218,6 @@ def detect_events(df_cand: pd.DataFrame,
 
     # fission
     for p, sub in evidence.groupby("parent"):
-        if assigned_pairs and p not in assigned_parents:
-            continue
         kids = list(sub["child"].unique())
         if len(kids) >= 2:
             Vi = _vol(P, p, "volume_um3")
@@ -231,8 +229,6 @@ def detect_events(df_cand: pd.DataFrame,
                 events.append({"event":"fission","parent":int(p),"children":[int(c) for c in kids]})
     # fusion
     for c, sub in evidence.groupby("child"):
-        if assigned_pairs and c not in assigned_children:
-            continue
         pars = list(sub["parent"].unique())
         if len(pars) >= 2:
             Vj = _vol(C, c, "volume_um3")
@@ -306,6 +302,7 @@ def main():
         vol = arr[t]
         if args.min_size>0:
             vol = remove_small_objects(vol.astype(bool), args.min_size).astype(np.uint8)
+            arr[t] = vol  # keep filtered volume for downstream previews/Napari
         lab = label_3d(vol, connectivity=args.connectivity)
         labels.append(lab)
 
@@ -378,7 +375,6 @@ def main():
 
         # event detection
         events = detect_events(df_cand, props[t], props[t+1],
-                               assigned_pairs=assigned_set,
                                iou_thr_event=args.iou_thr_event,
                                vol_tol=args.vol_tol)
         for ev in events:
