@@ -14,6 +14,45 @@ from tkinter import ttk, filedialog, messagebox
 def which_python():
     return sys.executable or "python"
 
+class _ToolTip:
+    def __init__(self, widget, text: str):
+        self.widget = widget
+        self.text = text
+        self.tip = None
+        widget.bind("<Enter>", self.show)
+        widget.bind("<Leave>", self.hide)
+
+    def show(self, event=None):
+        if self.tip or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 20
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        except Exception:
+            return
+        self.tip = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{int(x)}+{int(y)}")
+        lbl = tk.Label(
+            tw,
+            text=self.text,
+            justify="left",
+            background="#ffffe0",
+            relief="solid",
+            borderwidth=1,
+            wraplength=320,
+        )
+        lbl.pack(ipadx=4, ipady=2)
+
+    def hide(self, event=None):
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+def add_tip(widget, text: str):
+    if widget is not None:
+        _ToolTip(widget, text)
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -28,6 +67,9 @@ class App(tk.Tk):
         self.var_vx    = tk.StringVar(value="0.50")
         self.var_min_size = tk.StringVar(value="25")
         self.var_connectivity = tk.StringVar(value="1")
+        self.var_smooth_sigma = tk.StringVar(value="0.0")
+        self.var_closing_radius = tk.StringVar(value="0.0")
+        self.flag_closing_xy = tk.BooleanVar(value=False)
 
         self.var_iou_thr_event = tk.StringVar(value="0.06")
         self.var_max_disp_um   = tk.StringVar(value="2.0")
@@ -37,11 +79,16 @@ class App(tk.Tk):
         self.var_max_cost      = tk.StringVar(value="1.2")
         self.var_vol_tol       = tk.StringVar(value="0.35")
         self.var_min_event_persistence = tk.StringVar(value="1")
+        self.var_event_proximity_um = tk.StringVar(value="0.0")
+        self.var_gap_frames = tk.StringVar(value="1")
+        self.var_gap_max_disp_factor = tk.StringVar(value="1.5")
+        self.var_gap_frame_penalty = tk.StringVar(value="0.1")
 
         self.var_outdir = tk.StringVar()
         self.var_tracker_path = tk.StringVar(value=os.path.abspath("mito_4d_tracking_multicriteria_fixed.py"))
         self.var_reporter_path = tk.StringVar(value=os.path.abspath("mito_report_html.py"))
         self.var_viewer_path = tk.StringVar(value=os.path.abspath("mito_lineage_viewer_plotly.py"))
+        self.var_event_viewer_path = tk.StringVar(value=os.path.abspath("napari_event_table_viewer.py"))
         self.flag_viewer_prefer_edges = tk.BooleanVar(value=True)
         # Napari opts
         self.flag_napari_show_ids = tk.BooleanVar(value=True)
@@ -79,42 +126,84 @@ class App(tk.Tk):
 
         frm_in = ttk.Frame(nb); nb.add(frm_in, text="Inputs & Parameters")
         row = 0
-        ttk.Label(frm_in, text="Input 4D TIFF:").grid(row=row, column=0, sticky="e", padx=6, pady=6)
-        ttk.Entry(frm_in, textvariable=self.var_input, width=70).grid(row=row, column=1, sticky="we", padx=6, pady=6)
+        lbl_input = ttk.Label(frm_in, text="Input 4D TIFF:"); lbl_input.grid(row=row, column=0, sticky="e", padx=6, pady=6)
+        ent_input = ttk.Entry(frm_in, textvariable=self.var_input, width=70); ent_input.grid(row=row, column=1, sticky="we", padx=6, pady=6)
         ttk.Button(frm_in, text="Browse...", command=self._pick_input).grid(row=row, column=2, padx=6); row += 1
 
-        ttk.Label(frm_in, text="Output folder:").grid(row=row, column=0, sticky="e", padx=6, pady=6)
-        ttk.Entry(frm_in, textvariable=self.var_outdir, width=70).grid(row=row, column=1, sticky="we", padx=6, pady=6)
+        lbl_out = ttk.Label(frm_in, text="Output folder:"); lbl_out.grid(row=row, column=0, sticky="e", padx=6, pady=6)
+        ent_out = ttk.Entry(frm_in, textvariable=self.var_outdir, width=70); ent_out.grid(row=row, column=1, sticky="we", padx=6, pady=6)
         ttk.Button(frm_in, text="Choose...", command=self._pick_outdir).grid(row=row, column=2, padx=6); row += 1
 
-        ttk.Label(frm_in, text="Axis order:").grid(row=row, column=0, sticky="e", padx=6, pady=6)
-        ttk.Combobox(frm_in, textvariable=self.var_axis, values=["tzyx","zyxt","xyzt","tyzx","tzxy","ytzx"], width=10).grid(row=row, column=1, sticky="w", padx=6)
+        lbl_axis = ttk.Label(frm_in, text="Axis order:"); lbl_axis.grid(row=row, column=0, sticky="e", padx=6, pady=6)
+        cmb_axis = ttk.Combobox(frm_in, textvariable=self.var_axis, values=["tzyx","zyxt","xyzt","tyzx","tzxy","ytzx"], width=10); cmb_axis.grid(row=row, column=1, sticky="w", padx=6)
         ttk.Label(frm_in, text="Voxel size (um) Z Y X:").grid(row=row, column=1, sticky="e", padx=120)
         vs = ttk.Frame(frm_in); vs.grid(row=row, column=1, sticky="e", padx=6)
-        ttk.Entry(vs, textvariable=self.var_vz, width=6).pack(side="left", padx=2)
-        ttk.Entry(vs, textvariable=self.var_vy, width=6).pack(side="left", padx=2)
-        ttk.Entry(vs, textvariable=self.var_vx, width=6).pack(side="left", padx=2); row += 1
+        ent_vz = ttk.Entry(vs, textvariable=self.var_vz, width=6); ent_vz.pack(side="left", padx=2)
+        ent_vy = ttk.Entry(vs, textvariable=self.var_vy, width=6); ent_vy.pack(side="left", padx=2)
+        ent_vx = ttk.Entry(vs, textvariable=self.var_vx, width=6); ent_vx.pack(side="left", padx=2); row += 1
 
-        ttk.Label(frm_in, text="Min object size (vox):").grid(row=row, column=0, sticky="e", padx=6, pady=6)
-        ttk.Entry(frm_in, textvariable=self.var_min_size, width=8).grid(row=row, column=1, sticky="w", padx=6, pady=6)
+        lbl_min = ttk.Label(frm_in, text="Min object size (vox):"); lbl_min.grid(row=row, column=0, sticky="e", padx=6, pady=6)
+        ent_min = ttk.Entry(frm_in, textvariable=self.var_min_size, width=8); ent_min.grid(row=row, column=1, sticky="w", padx=6, pady=6)
         ttk.Label(frm_in, text="Connectivity:").grid(row=row, column=1, sticky="e", padx=120)
-        ttk.Combobox(frm_in, textvariable=self.var_connectivity, values=["1","2"], width=5).grid(row=row, column=1, sticky="e", padx=6); row += 1
+        cmb_conn = ttk.Combobox(frm_in, textvariable=self.var_connectivity, values=["1","2"], width=5); cmb_conn.grid(row=row, column=1, sticky="e", padx=6); row += 1
+
+        add_tip(ent_input, "Path to the 4D binary/label TIFF stack (axes given by Axis order).")
+        add_tip(ent_out, "Folder where results (CSVs, TIFFs, report) will be written.")
+        add_tip(cmb_axis, "Axis permutation of the input stack (must include t,z,y,x).")
+        vox_tip = "Voxel size in microns (Z, Y, X). Critical for distances and volumes."
+        for w in (ent_vz, ent_vy, ent_vx):
+            add_tip(w, vox_tip)
+        add_tip(ent_min, "Remove connected components smaller than this many voxels before tracking.")
+        add_tip(cmb_conn, "Connectivity for 3D labeling: 1=6-neighbors, 2=26-neighbors.")
+
+        prep = ttk.LabelFrame(frm_in, text="Preprocessing"); prep.grid(row=row, column=0, columnspan=3, sticky="we", padx=6, pady=6); r0 = 0
+        ttk.Label(prep, text="Smooth sigma (vox):").grid(row=r0, column=0, sticky="e", padx=6, pady=3)
+        ent_smooth = ttk.Entry(prep, textvariable=self.var_smooth_sigma, width=8); ent_smooth.grid(row=r0, column=1, sticky="w", padx=6)
+        ttk.Label(prep, text="Closing radius (vox):").grid(row=r0, column=2, sticky="e", padx=6)
+        ent_close = ttk.Entry(prep, textvariable=self.var_closing_radius, width=8); ent_close.grid(row=r0, column=3, sticky="w", padx=6)
+        chk_xy = ttk.Checkbutton(prep, text="XY only", variable=self.flag_closing_xy); chk_xy.grid(row=r0, column=4, sticky="w", padx=8)
+        row += 1
+
+        add_tip(ent_smooth, "Gaussian sigma (voxels). Smooths the binary mask to reduce flicker; 0 disables.")
+        add_tip(ent_close, "Binary closing radius (voxels). Bridges tiny gaps; 0 disables. Larger values risk merging neighbors.")
+        add_tip(chk_xy, "If checked, closing is applied per Z-slice (disk) instead of full 3D ball; safer for anisotropic data.")
 
         block = ttk.LabelFrame(frm_in, text="Linking / Event parameters"); block.grid(row=row, column=0, columnspan=3, sticky="we", padx=6, pady=6); r=0
         ttk.Label(block, text="IoU thr (event evidence):").grid(row=r, column=0, sticky="e", padx=6, pady=3)
-        ttk.Entry(block, textvariable=self.var_iou_thr_event, width=8).grid(row=r, column=1, sticky="w", padx=6)
+        ent_iou = ttk.Entry(block, textvariable=self.var_iou_thr_event, width=8); ent_iou.grid(row=r, column=1, sticky="w", padx=6)
         ttk.Label(block, text="Max displacement (um):").grid(row=r, column=2, sticky="e", padx=6)
-        ttk.Entry(block, textvariable=self.var_max_disp_um, width=8).grid(row=r, column=3, sticky="w", padx=6); r+=1
+        ent_maxdisp = ttk.Entry(block, textvariable=self.var_max_disp_um, width=8); ent_maxdisp.grid(row=r, column=3, sticky="w", padx=6); r+=1
         ttk.Label(block, text="Weights (IoU, Dist, Vol):").grid(row=r, column=0, sticky="e", padx=6)
-        ttk.Entry(block, textvariable=self.var_w_iou, width=6).grid(row=r, column=1, sticky="w", padx=2)
-        ttk.Entry(block, textvariable=self.var_w_dist, width=6).grid(row=r, column=1, sticky="w", padx=50)
-        ttk.Entry(block, textvariable=self.var_w_vol, width=6).grid(row=r, column=1, sticky="w", padx=100); r+=1
+        ent_wiou = ttk.Entry(block, textvariable=self.var_w_iou, width=6); ent_wiou.grid(row=r, column=1, sticky="w", padx=2)
+        ent_wdist = ttk.Entry(block, textvariable=self.var_w_dist, width=6); ent_wdist.grid(row=r, column=1, sticky="w", padx=50)
+        ent_wvol = ttk.Entry(block, textvariable=self.var_w_vol, width=6); ent_wvol.grid(row=r, column=1, sticky="w", padx=100); r+=1
         ttk.Label(block, text="Max cost:").grid(row=r, column=0, sticky="e", padx=6)
-        ttk.Entry(block, textvariable=self.var_max_cost, width=8).grid(row=r, column=1, sticky="w", padx=6)
+        ent_maxcost = ttk.Entry(block, textvariable=self.var_max_cost, width=8); ent_maxcost.grid(row=r, column=1, sticky="w", padx=6)
         ttk.Label(block, text="Volume tolerance:").grid(row=r, column=2, sticky="e", padx=6)
-        ttk.Entry(block, textvariable=self.var_vol_tol, width=8).grid(row=r, column=3, sticky="w", padx=6); r+=1
+        ent_voltol = ttk.Entry(block, textvariable=self.var_vol_tol, width=8); ent_voltol.grid(row=r, column=3, sticky="w", padx=6); r+=1
         ttk.Label(block, text="Min event persistence (frames):").grid(row=r, column=0, sticky="e", padx=6)
-        ttk.Entry(block, textvariable=self.var_min_event_persistence, width=8).grid(row=r, column=1, sticky="w", padx=6); r+=1
+        ent_persist = ttk.Entry(block, textvariable=self.var_min_event_persistence, width=8); ent_persist.grid(row=r, column=1, sticky="w", padx=6); r+=1
+        ttk.Label(block, text="Event proximity (um):").grid(row=r, column=0, sticky="e", padx=6)
+        ent_evtprox = ttk.Entry(block, textvariable=self.var_event_proximity_um, width=8); ent_evtprox.grid(row=r, column=1, sticky="w", padx=6)
+        ttk.Label(block, text="Gap close (frames):").grid(row=r, column=2, sticky="e", padx=6)
+        ent_gap = ttk.Entry(block, textvariable=self.var_gap_frames, width=8); ent_gap.grid(row=r, column=3, sticky="w", padx=6); r+=1
+        ttk.Label(block, text="Gap max disp factor:").grid(row=r, column=0, sticky="e", padx=6)
+        ent_gapfact = ttk.Entry(block, textvariable=self.var_gap_max_disp_factor, width=8); ent_gapfact.grid(row=r, column=1, sticky="w", padx=6)
+        ttk.Label(block, text="Gap frame penalty:").grid(row=r, column=2, sticky="e", padx=6)
+        ent_gappen = ttk.Entry(block, textvariable=self.var_gap_frame_penalty, width=8); ent_gappen.grid(row=r, column=3, sticky="w", padx=6); r+=1
+
+        add_tip(ent_iou, "Minimum IoU to treat a candidate as event evidence (overlap-based fission/fusion).")
+        add_tip(ent_maxdisp, "Maximum centroid jump (um) allowed when IoU=0; prunes impossible links.")
+        add_tip(ent_wiou, "Weight of (1 - IoU) term in the link cost.")
+        add_tip(ent_wdist, "Weight of normalized distance term in the link cost.")
+        add_tip(ent_wvol, "Weight of volume difference term in the link cost.")
+        add_tip(ent_maxcost, "Links with total cost above this threshold are discarded.")
+        add_tip(ent_voltol, "Relative volume tolerance for fission/fusion (|V_children - V_parent| / max <= tol).")
+        add_tip(ent_persist, "Require each track to exist this many frames before/after an event to accept it.")
+        add_tip(ent_evtprox, "Also treat pairs within this distance (um) as event evidence even if IoU is low (helps fast movers).")
+        add_tip(ent_gap, "Maximum gap (frames) to bridge when reconnecting tracks after a disappearance.")
+        add_tip(ent_gapfact, "Multiplier on max displacement per skipped frame during gap closing (e.g., 1.5).")
+        add_tip(ent_gappen, "Additive cost per skipped frame during gap closing; higher values make bridging harder.")
 
         flags = ttk.LabelFrame(frm_in, text="Options"); flags.grid(row=row+1, column=0, columnspan=3, sticky="we", padx=6, pady=6)
         ttk.Checkbutton(flags, text="Save PNG Z-MIPs", variable=self.flag_save_pngs).grid(row=0, column=0, sticky="w", padx=6, pady=3)
@@ -160,8 +249,12 @@ class App(tk.Tk):
 
         ttk.Button(frm_sc, text="Browse...", command=self._pick_viewer).grid(row=1, column=2, padx=6)
 
+        ttk.Label(frm_sc, text="Event table viewer:").grid(row=2, column=0, sticky="e", padx=6, pady=6)
+        ttk.Entry(frm_sc, textvariable=self.var_event_viewer_path, width=70).grid(row=2, column=1, sticky="we", padx=6, pady=6)
+        ttk.Button(frm_sc, text="Browse...", command=self._pick_event_viewer).grid(row=2, column=2, padx=6)
+
         napari_opts = ttk.LabelFrame(frm_sc, text="Napari viewer defaults")
-        napari_opts.grid(row=2, column=0, columnspan=3, sticky="we", padx=6, pady=6)
+        napari_opts.grid(row=3, column=0, columnspan=3, sticky="we", padx=6, pady=6)
         ttk.Checkbutton(napari_opts, text="Show IDs", variable=self.flag_napari_show_ids).grid(row=0, column=0, sticky="w", padx=6, pady=4)
         ttk.Label(napari_opts, text="Color by:").grid(row=0, column=1, sticky="e", padx=6)
         ttk.Combobox(napari_opts, textvariable=self.var_napari_color_by, values=["track","label"], width=10, state="readonly").grid(row=0, column=2, sticky="w", padx=6)
@@ -175,6 +268,16 @@ class App(tk.Tk):
         ttk.Spinbox(napari_opts, from_=1.0, to=20.0, increment=0.5, textvariable=self.var_napari_event_size, width=6).grid(row=2, column=3, sticky="w", padx=6)
         ttk.Label(napari_opts, text="Viewer auto-loads objects.csv, labels.tif, and edges_all.csv when present.", wraplength=360).grid(row=3, column=0, columnspan=4, sticky="w", padx=6, pady=(4,0))
 
+        frm_evt = ttk.Frame(nb); nb.add(frm_evt, text="Event Table Viewer")
+        ttk.Label(frm_evt, text="Browse edges_all.csv via a clickable table; selection jumps the Napari view to that edge.").grid(row=0, column=0, columnspan=3, sticky="w", padx=8, pady=(8,4))
+        ttk.Label(frm_evt, text="Event table viewer script:").grid(row=1, column=0, sticky="e", padx=8, pady=6)
+        ttk.Entry(frm_evt, textvariable=self.var_event_viewer_path, width=70).grid(row=1, column=1, sticky="we", padx=6, pady=6)
+        ttk.Button(frm_evt, text="Browse...", command=self._pick_event_viewer).grid(row=1, column=2, padx=6, pady=6)
+        ttk.Label(frm_evt, text="Requires objects.csv and edges_all.csv in the output folder; uses labels.tif/image if present.", wraplength=640, foreground="#444").grid(row=2, column=0, columnspan=3, sticky="w", padx=8, pady=(0,8))
+        btn_evt = ttk.Button(frm_evt, text="Open Event Table Viewer", command=self.open_event_table_viewer)
+        btn_evt.grid(row=3, column=0, columnspan=3, pady=8)
+        self._action_buttons.append(btn_evt)
+
         act = ttk.Frame(self); act.pack(fill="x", padx=8)
         btn = ttk.Button(act, text="Run Tracking", command=self.run_tracking); btn.pack(side="left", padx=6, pady=6)
         self._action_buttons.append(btn)
@@ -183,6 +286,8 @@ class App(tk.Tk):
         btn = ttk.Button(act, text="Generate HTML Report", command=self.run_report); btn.pack(side="left", padx=6, pady=6)
         self._action_buttons.append(btn)
         btn = ttk.Button(act, text="Open Lineage (HTML)", command=self.open_lineage); btn.pack(side="left", padx=6, pady=6)
+        self._action_buttons.append(btn)
+        btn = ttk.Button(act, text="Open Event Table Viewer", command=self.open_event_table_viewer); btn.pack(side="left", padx=6, pady=6)
         self._action_buttons.append(btn)
         cfg = ttk.Frame(act)
         cfg.pack(side="right", padx=6, pady=6)
@@ -211,6 +316,10 @@ class App(tk.Tk):
         p = filedialog.askopenfilename(title="Choose viewer script", filetypes=[("Python","*.py"),("All","*.*")])
         if p: self.var_viewer_path.set(p)
 
+    def _pick_event_viewer(self):
+        p = filedialog.askopenfilename(title="Choose event table viewer script", filetypes=[("Python","*.py"),("All","*.*")])
+        if p: self.var_event_viewer_path.set(p)
+
     def _log(self, msg):
         # Ensure UI updates run on the Tk main thread even when log calls originate from workers.
         def append():
@@ -229,6 +338,8 @@ class App(tk.Tk):
                 "--voxel_size", self.var_vz.get(), self.var_vy.get(), self.var_vx.get(),
                 "--min_size", self.var_min_size.get(),
                 "--connectivity", self.var_connectivity.get(),
+                "--smooth_sigma", self.var_smooth_sigma.get(),
+                "--closing_radius", self.var_closing_radius.get(),
                 "--iou_thr_event", self.var_iou_thr_event.get(),
                 "--max_disp_um", self.var_max_disp_um.get(),
                 "--w_iou", self.var_w_iou.get(),
@@ -237,7 +348,12 @@ class App(tk.Tk):
                 "--max_cost", self.var_max_cost.get(),
                 "--vol_tol", self.var_vol_tol.get(),
                 "--min_event_persistence", self.var_min_event_persistence.get(),
+                "--event_proximity_um", self.var_event_proximity_um.get(),
+                "--gap_frames", self.var_gap_frames.get(),
+                "--gap_max_disp_factor", self.var_gap_max_disp_factor.get(),
+                "--gap_frame_penalty", self.var_gap_frame_penalty.get(),
                 "--outdir", self.var_outdir.get()]
+        if self.flag_closing_xy.get(): args.append("--closing_xy")
         if self.flag_save_pngs.get(): args.append("--save_pngs")
         save_labels = self.flag_save_labels.get()
         if (napari_override or self.flag_napari.get()) and not save_labels:
@@ -302,6 +418,8 @@ class App(tk.Tk):
             "var_vx": self.var_vx,
             "var_min_size": self.var_min_size,
             "var_connectivity": self.var_connectivity,
+            "var_smooth_sigma": self.var_smooth_sigma,
+            "var_closing_radius": self.var_closing_radius,
             "var_iou_thr_event": self.var_iou_thr_event,
             "var_max_disp_um": self.var_max_disp_um,
             "var_w_iou": self.var_w_iou,
@@ -310,9 +428,14 @@ class App(tk.Tk):
             "var_max_cost": self.var_max_cost,
             "var_vol_tol": self.var_vol_tol,
             "var_min_event_persistence": self.var_min_event_persistence,
+            "var_event_proximity_um": self.var_event_proximity_um,
+            "var_gap_frames": self.var_gap_frames,
+            "var_gap_max_disp_factor": self.var_gap_max_disp_factor,
+            "var_gap_frame_penalty": self.var_gap_frame_penalty,
             "var_tracker_path": self.var_tracker_path,
             "var_reporter_path": self.var_reporter_path,
             "var_viewer_path": self.var_viewer_path,
+            "var_event_viewer_path": self.var_event_viewer_path,
             "var_napari_color_by": self.var_napari_color_by,
             "var_napari_point_size": self.var_napari_point_size,
             "var_napari_text_size": self.var_napari_text_size,
@@ -338,6 +461,7 @@ class App(tk.Tk):
             "flag_render_lineage": self.flag_render_lineage,
             "flag_viewer_prefer_edges": self.flag_viewer_prefer_edges,
             "flag_napari_show_ids": self.flag_napari_show_ids,
+            "flag_closing_xy": self.flag_closing_xy,
         }
         return {
             "strings": {key: var.get() for key, var in string_map.items()},
@@ -364,6 +488,8 @@ class App(tk.Tk):
             "var_vx": self.var_vx,
             "var_min_size": self.var_min_size,
             "var_connectivity": self.var_connectivity,
+            "var_smooth_sigma": self.var_smooth_sigma,
+            "var_closing_radius": self.var_closing_radius,
             "var_iou_thr_event": self.var_iou_thr_event,
             "var_max_disp_um": self.var_max_disp_um,
             "var_w_iou": self.var_w_iou,
@@ -372,9 +498,14 @@ class App(tk.Tk):
             "var_max_cost": self.var_max_cost,
             "var_vol_tol": self.var_vol_tol,
             "var_min_event_persistence": self.var_min_event_persistence,
+            "var_event_proximity_um": self.var_event_proximity_um,
+            "var_gap_frames": self.var_gap_frames,
+            "var_gap_max_disp_factor": self.var_gap_max_disp_factor,
+            "var_gap_frame_penalty": self.var_gap_frame_penalty,
             "var_tracker_path": self.var_tracker_path,
             "var_reporter_path": self.var_reporter_path,
             "var_viewer_path": self.var_viewer_path,
+            "var_event_viewer_path": self.var_event_viewer_path,
             "var_napari_color_by": self.var_napari_color_by,
             "var_napari_point_size": self.var_napari_point_size,
             "var_napari_text_size": self.var_napari_text_size,
@@ -400,6 +531,7 @@ class App(tk.Tk):
             "flag_render_lineage": self.flag_render_lineage,
             "flag_viewer_prefer_edges": self.flag_viewer_prefer_edges,
             "flag_napari_show_ids": self.flag_napari_show_ids,
+            "flag_closing_xy": self.flag_closing_xy,
         }
         for key, value in state.get("strings", {}).items():
             var = string_map.get(key)
@@ -521,6 +653,23 @@ class App(tk.Tk):
         args += ["--out", out_html, "--embed_js", "inline", "--open"]
         return args
 
+    def _build_event_table_viewer_args(self):
+        py = which_python()
+        script = self.var_event_viewer_path.get()
+        outdir = self.var_outdir.get()
+        objects = os.path.join(outdir, "objects.csv")
+        edges = os.path.join(outdir, "edges_all.csv")
+        args = [py, script, "--objects", objects, "--edges", edges, "--axis", self.var_axis.get()]
+        # optional stacks
+        if self.var_input.get():
+            args += ["--image", self.var_input.get()]
+        labels_path = os.path.join(outdir, "labels.tif")
+        if os.path.exists(labels_path):
+            args += ["--labels", labels_path]
+        # voxel size
+        args += ["--voxel-size-um", self.var_vz.get(), self.var_vy.get(), self.var_vx.get()]
+        return args
+
     def open_lineage(self):
         if not self.var_outdir.get():
             messagebox.showwarning("Missing", "Please choose an output folder where results were written.")
@@ -531,6 +680,28 @@ class App(tk.Tk):
             self._log(str(e) + "\nRun tracking first to generate outputs.")
             messagebox.showwarning("Missing outputs", str(e) + "\nRun tracking first to generate outputs.")
             return
+        self._run_args_async(args)
+
+    def open_event_table_viewer(self):
+        outdir = self.var_outdir.get()
+        if not outdir:
+            messagebox.showwarning("Missing", "Please choose an output folder where results were written.")
+            return
+        objects = os.path.join(outdir, "objects.csv")
+        edges = os.path.join(outdir, "edges_all.csv")
+        missing = [p for p in (objects, edges) if not os.path.exists(p)]
+        if missing:
+            msg = "Missing required files: " + ", ".join(os.path.basename(m) for m in missing)
+            self._log(msg + "\nRun tracking first to generate outputs.\n")
+            messagebox.showwarning("Missing outputs", msg + "\nRun tracking first to generate outputs.")
+            return
+        try:
+            args = self._build_event_table_viewer_args()
+        except Exception as e:
+            self._log(str(e) + "\n")
+            messagebox.showwarning("Event table viewer", str(e))
+            return
+        self._log("Launching Event Table Viewer...\n")
         self._run_args_async(args)
 
 

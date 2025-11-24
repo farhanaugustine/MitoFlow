@@ -40,15 +40,34 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pandas.errors import EmptyDataError
 
-def parse_axis(axis: str) -> Tuple[int,int,int,int]:
+def parse_axis(axis: str) -> str:
     axis = axis.lower()
-    if set(axis) != set("tzyx"):
-        raise ValueError("--axis must be a permutation of 'tzyx'")
-    return axis.index('t'), axis.index('z'), axis.index('y'), axis.index('x')
+    allowed = set("tzyxc")
+    if not set(axis) <= allowed:
+        raise ValueError("--axis may contain only t,z,y,x,c")
+    if axis.count("t") > 1 or axis.count("c") > 1:
+        raise ValueError("--axis may contain at most one 't' and one 'c'")
+    for ch in "zyx":
+        if ch not in axis:
+            raise ValueError("--axis must include z,y,x")
+    return axis
 
 def to_tzyx(arr, axis):
-    t,z,y,x = parse_axis(axis)
-    return np.transpose(arr, (t,z,y,x))
+    axis = parse_axis(axis)
+    data = arr
+    if "c" in axis:
+        c_pos = axis.index("c")
+        if c_pos >= data.ndim:
+            raise ValueError(f"--axis='{axis}' expects a channel axis, data has shape {data.shape}")
+        data = np.take(data, indices=0, axis=c_pos)
+        axis = axis.replace("c", "")
+    if "t" not in axis:
+        data = np.expand_dims(data, axis=0)
+        axis = "t" + axis
+    if len(axis) != data.ndim:
+        raise ValueError(f"--axis='{axis}' expects {len(axis)} dims, data has shape {data.shape}")
+    order = [axis.index(ch) for ch in "tzyx"]
+    return np.transpose(data, order)
 
 def mip_z(vol_zyx: np.ndarray) -> np.ndarray:
     # Z-MIP
@@ -122,10 +141,14 @@ def main():
 
     # Load image and CSVs
     arr = imread(args.input)
-    if arr.ndim != 4:
-        print(f"Expected 4D TIFF, got {arr.shape}", file=sys.stderr)
+    if arr.ndim < 3 or arr.ndim > 5:
+        print(f"Expected 3D/4D TIFF (optionally with channel), got {arr.shape}", file=sys.stderr)
         sys.exit(2)
-    arr = to_tzyx(arr, args.axis)  # (T,Z,Y,X)
+    try:
+        arr = to_tzyx(arr, args.axis)  # (T,Z,Y,X)
+    except ValueError as exc:
+        print(f"Axis handling error for shape {arr.shape}: {exc}", file=sys.stderr)
+        sys.exit(2)
     T, Z, Y, X = arr.shape
 
     objects_path = os.path.join(args.outdir, "objects.csv")

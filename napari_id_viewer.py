@@ -50,6 +50,16 @@ class _State:
     show_fusion_edges: bool = True
     show_fission_nodes: bool = True
     show_fusion_nodes: bool = True
+    local_filter_enabled: bool = False
+    local_filter_radius_um: float = 0.0
+    local_filter_time_window: int = 0
+    edge_time_window: int = 0
+    filter_focus_edges: bool = False
+    verified_path: Optional[str] = None
+    events_df: Optional[pd.DataFrame] = None
+    event_rows: Optional[pd.DataFrame] = None
+    current_event_idx: Optional[int] = None
+    show_only_event: bool = False
     col_t: str = "t"
     col_id: str = "label_id"
     col_track: str = "track_id"
@@ -69,20 +79,27 @@ class _State:
 
 def to_tzyx(arr: np.ndarray, axis: str) -> np.ndarray:
     axis = axis.lower()
-    valid = set("tzyx")
-    if any(ch not in valid for ch in axis):
-        raise ValueError(f"Invalid axis spec '{axis}'. Use characters t, z, y, x.")
-    need = ["t", "y", "x"]
-    for ch in need:
+    allowed = set("tzyxc")
+    if not set(axis) <= allowed:
+        raise ValueError(f"Invalid axis spec '{axis}'. Use characters t, z, y, x, c.")
+    if axis.count("t") > 1 or axis.count("c") > 1:
+        raise ValueError(f"Axis spec '{axis}' may contain at most one 't' and one 'c'.")
+    for ch in "zyx":
         if ch not in axis:
-            raise ValueError(f"Axis spec '{axis}' must include t, y, and x.")
-    add_z = "z" not in axis
+            raise ValueError(f"Axis spec '{axis}' must include z, y, and x.")
     data = arr
-    order_axis = axis
-    if add_z:
-        data = np.expand_dims(data, axis=-1)
-        order_axis = axis + "z"
-    order = [order_axis.index(ch) for ch in "tzyx"]
+    if "c" in axis:
+        c_pos = axis.index("c")
+        if c_pos >= data.ndim:
+            raise ValueError(f"Axis spec '{axis}' expects a channel axis, data shape is {data.shape}.")
+        data = np.take(data, indices=0, axis=c_pos)
+        axis = axis.replace("c", "")
+    if "t" not in axis:
+        data = np.expand_dims(data, axis=0)
+        axis = "t" + axis
+    if len(axis) != data.ndim:
+        raise ValueError(f"Axis spec '{axis}' expects {len(axis)} dims, data shape is {data.shape}.")
+    order = [axis.index(ch) for ch in "tzyx"]
     return np.transpose(data, order)
 
 
@@ -152,7 +169,7 @@ def _maybe_to_pixels(
     name = (column_name or "").lower()
     if "um" in name or "micron" in name:
         scale = voxel_size_um[axis_index]
-        if not np.isfinite(scale) or scale == 0:
+        if (not np.isfinite(scale)) or (scale <= 0):
             return float("nan")
         return val / scale
     return val
@@ -271,14 +288,17 @@ def build_points_from_labels(labels: np.ndarray) -> Tuple[np.ndarray, Dict[str, 
 
 
 def build_edge_geometry(
-    edges_df: Optional[pd.DataFrame], lookup: Dict[Tuple[int, int], np.ndarray]
+    edges_df: Optional[pd.DataFrame], lookup: Dict[Tuple[int, int], np.ndarray], focus_track: Optional[int] = None
 ) -> Dict[str, List[np.ndarray]]:
     result = {
         "continuations": [],
+        "gap": [],
         "fission": [],
         "fusion": [],
         "fission_nodes": [],
         "fusion_nodes": [],
+        "fission_idx": [],
+        "fusion_idx": [],
     }
     skipped = {"continuations": 0, "fission": 0, "fusion": 0}
     if edges_df is None or lookup is None:
@@ -305,12 +325,26 @@ def build_edge_geometry(
             continue
         segment = np.vstack([start, end]).astype(float)
         edge_type = str(getattr(row, "edge_type", "continuation")).lower()
+        if focus_track is not None:
+            ptid = getattr(row, "parent_track_id", None)
+            ctid = getattr(row, "child_track_id", None)
+            if ptid is None and ctid is None:
+                pass
+            else:
+                keep = (ptid == focus_track) or (ctid == focus_track)
+                if not keep:
+                    continue
+        idx_val = getattr(row, "Index", None)
         if edge_type == "fission":
             result["fission"].append(segment)
             result["fission_nodes"].append(end.copy())
+            result["fission_idx"].append(idx_val if idx_val is not None else len(result["fission_idx"]))
         elif edge_type == "fusion":
             result["fusion"].append(segment)
             result["fusion_nodes"].append(end.copy())
+            result["fusion_idx"].append(idx_val if idx_val is not None else len(result["fusion_idx"]))
+        elif edge_type == "gap":
+            result["gap"].append(segment)
         else:
             result["continuations"].append(segment)
     result["_skipped"] = skipped
@@ -371,10 +405,105 @@ def _recolor_layers(state: _State) -> None:
             state.points_layer.face_color = np.asarray(colors, dtype=float)
 
 
+def _current_focus(state: _State) -> Tuple[Optional[np.ndarray], Optional[int]]:
+    try:
+        steps = state.viewer.dims.current_step
+        if len(steps) >= 4:
+            return np.array([float(steps[1]), float(steps[2]), float(steps[3])], dtype=float), int(steps[0])
+    except Exception:
+        pass
+    return None, None
+
+def _filter_geometry_local(geometry: Dict[str, List[np.ndarray]], state: _State) -> Dict[str, List[np.ndarray]]:
+    focus_xyz, focus_t = _current_focus(state)
+    spacing = np.asarray(state.voxel_size_um if state.voxel_size_um else (1.0, 1.0, 1.0), dtype=float)
+    radius_um = float(state.local_filter_radius_um)
+    dt_local = max(0, int(state.local_filter_time_window))
+    dt_global = max(0, int(state.edge_time_window))
+    use_space = bool(state.local_filter_enabled and radius_um > 0 and focus_xyz is not None)
+    use_time = (dt_local > 0 or dt_global > 0) and focus_t is not None
+    focus_um = focus_xyz * spacing if focus_xyz is not None else None
+
+    def _segment_visible(seg: np.ndarray) -> bool:
+        if seg.shape[0] < 2 or seg.shape[1] < 4:
+            return False
+        t0, t1 = seg[0, 0], seg[1, 0]
+        if use_time:
+            dt_eff = dt_local if state.local_filter_enabled else dt_global
+            if min(abs(t0 - focus_t), abs(t1 - focus_t)) > dt_eff:
+                return False
+        if not use_space:
+            return True
+        pts = [seg[0][1:], seg[1][1:]]
+        for pt in pts:
+            dist = np.linalg.norm(np.asarray(pt, dtype=float) * spacing - focus_um)
+            if dist <= radius_um:
+                return True
+        return False
+
+    def _node_visible(pt: np.ndarray) -> bool:
+        if pt.shape[0] < 4:
+            return False
+        if use_time:
+            dt_eff = dt_local if state.local_filter_enabled else dt_global
+            if abs(pt[0] - focus_t) > dt_eff:
+                return False
+        if not use_space:
+            return True
+        dist = np.linalg.norm(np.asarray(pt[1:], dtype=float) * spacing - focus_um)
+        return dist <= radius_um
+
+    filtered: Dict[str, List[np.ndarray]] = {k: [] for k in geometry.keys()}
+    for key in ("continuations", "gap", "fission", "fusion"):
+        for seg in geometry.get(key, []):
+            if _segment_visible(seg):
+                filtered[key].append(seg)
+    for key in ("fission_nodes", "fusion_nodes"):
+        for pt in geometry.get(key, []):
+            arr = np.asarray(pt, dtype=float)
+            if _node_visible(arr):
+                filtered[key].append(arr)
+    filtered["_skipped"] = geometry.get("_skipped", {})
+    filtered["fission_idx"] = geometry.get("fission_idx", [])
+    filtered["fusion_idx"] = geometry.get("fusion_idx", [])
+    return filtered
+
+
 def _refresh_edges(state: _State) -> None:
-    geometry = build_edge_geometry(state.edges_df, state.lookup)
+    if state.edges_df is None or state.edges_df.empty:
+        return
+    focus_tid = None
+    if state.filter_focus_edges and state.audit_history:
+        sel = state.audit_history[-1]
+        focus_tid = sel
+    df_use = state.edges_df
+    if state.show_only_event and state.current_event_idx is not None and state.event_rows is not None and not state.event_rows.empty:
+        if 0 <= state.current_event_idx < len(state.event_rows):
+            ev = state.event_rows.iloc[state.current_event_idx]
+            mask_event = (
+                (df_use["edge_type"] == ev["edge_type"]) &
+                (df_use["t_from"] == ev["t_from"]) &
+                (df_use["t_to"] == ev["t_to"]) &
+                (df_use["parent_label"] == ev["parent_label"]) &
+                (df_use["child_label"] == ev["child_label"])
+            )
+            df_ev = df_use[mask_event]
+            tracks_keep = set()
+            try:
+                tracks_keep.add(int(ev.get("parent_track_id", -1)))
+                tracks_keep.add(int(ev.get("child_track_id", -1)))
+            except Exception:
+                pass
+            df_cont = df_use[
+                (df_use["edge_type"].isin(["continuation","gap"])) &
+                (df_use["parent_track_id"].isin(tracks_keep) | df_use["child_track_id"].isin(tracks_keep))
+            ]
+            df_use = pd.concat([df_ev, df_cont], ignore_index=False)
+    geometry = build_edge_geometry(df_use, state.lookup, focus_track=focus_tid)
+    geometry = _filter_geometry_local(geometry, state)
     edge_specs = {
         "continuations": ("Continuation edges", "white", state.show_cont_edges),
+        "gap": ("Gap edges", "cyan", state.show_cont_edges),
         "fission": ("Fission edges", "magenta", state.show_fission_edges),
         "fusion": ("Fusion edges", "orange", state.show_fusion_edges),
     }
@@ -382,6 +511,44 @@ def _refresh_edges(state: _State) -> None:
         "fission_nodes": ("Fission nodes", "magenta", state.show_fission_nodes),
         "fusion_nodes": ("Fusion nodes", "orange", state.show_fusion_nodes),
     }
+
+    def _node_in_labels(pt: np.ndarray) -> bool:
+        if state.labels_layer is None:
+            return True
+        data = getattr(state.labels_layer, "data", None)
+        if data is None:
+            return True
+        try:
+            t = int(round(pt[0]))
+            z = int(round(pt[1]))
+            y = int(round(pt[2]))
+            x = int(round(pt[3]))
+        except Exception:
+            return True
+        try:
+            if data.ndim == 5:  # (T, C, Z, Y, X)
+                if t < 0 or t >= data.shape[0]:
+                    return False
+                z_idx = np.clip(z, 0, data.shape[2]-1)
+                y_idx = np.clip(y, 0, data.shape[3]-1)
+                x_idx = np.clip(x, 0, data.shape[4]-1)
+                return data[t, 0, z_idx, y_idx, x_idx] != 0
+            elif data.ndim == 4:  # (T, Z, Y, X)
+                if t < 0 or t >= data.shape[0]:
+                    return False
+                z_idx = np.clip(z, 0, data.shape[1]-1)
+                y_idx = np.clip(y, 0, data.shape[2]-1)
+                x_idx = np.clip(x, 0, data.shape[3]-1)
+                return data[t, z_idx, y_idx, x_idx] != 0
+            elif data.ndim == 3:  # (Z, Y, X) no time axis
+                z_idx = np.clip(z, 0, data.shape[0]-1)
+                y_idx = np.clip(y, 0, data.shape[1]-1)
+                x_idx = np.clip(x, 0, data.shape[2]-1)
+                return data[z_idx, y_idx, x_idx] != 0
+        except Exception:
+            return True
+        return True
+
     for key, (title, color, visible) in edge_specs.items():
         data = geometry.get(key, [])
         layer = state.edge_layers.get(key)
@@ -392,36 +559,68 @@ def _refresh_edges(state: _State) -> None:
                     shape_type="path",
                     name=title,
                     edge_color=color,
-                    edge_width=state.edge_width,
-                    blending="translucent",
+                    edge_width=max(state.edge_width, 1.5 if key in ("fission","fusion") else state.edge_width),
+                    blending="additive",
                 )
                 state.edge_layers[key] = layer
             else:
                 layer.data = data
                 layer.edge_color = color
-            layer.edge_width = state.edge_width
+            layer.edge_width = max(state.edge_width, 1.5 if key in ("fission","fusion") else state.edge_width)
             layer.visible = bool(visible)
+            try:
+                state.viewer.layers.move(state.viewer.layers.index(layer), len(state.viewer.layers) - 1)
+            except Exception:
+                pass
         elif layer is not None:
             layer.data = []
             layer.visible = False
+    state._geom_indices = {"fission_idx": geometry.get("fission_idx", []), "fusion_idx": geometry.get("fusion_idx", [])}
     for key, (title, color, visible) in node_specs.items():
-        points = geometry.get(key, [])
+        pts_raw = geometry.get(key, [])
+        points = [pt for pt in pts_raw if _node_in_labels(np.asarray(pt, dtype=float))]
         layer = state.node_layers.get(key)
         if points:
             arr = np.asarray(points, dtype=float)
+            texts = None
+            idx_list = state._geom_indices.get("fission_idx" if key == "fission_nodes" else "fusion_idx", [])
+            if idx_list and state.edges_df is not None:
+                strings = []
+                for idx_val in idx_list[:len(arr)]:
+                    try:
+                        row = state.edges_df.iloc[idx_val]
+                        strings.append(f"{row['edge_type']} p{int(row['parent_label'])}->c{int(row['child_label'])}")
+                    except Exception:
+                        strings.append("")
+                texts = {"string": strings, "size": 10, "color": "white", "anchor": "upper_left"}
+            bright_color = "yellow" if key == "fission_nodes" else "cyan"
             if layer is None:
                 layer = state.viewer.add_points(
                     arr,
                     name=title,
                     ndim=4,
-                    size=state.event_size,
-                    face_color=color,
+                    size=max(state.event_size, 9.0),
+                    face_color=bright_color,
+                    edge_color="black",
+                    edge_width=0.8,
                 )
                 state.node_layers[key] = layer
             else:
                 layer.data = arr
-            layer.size = state.event_size
+            if texts:
+                try:
+                    layer.text = texts
+                except Exception:
+                    pass
+            layer.face_color = bright_color
+            layer.edge_color = "black"
+            layer.edge_width = 0.8
+            layer.size = max(state.event_size, 9.0)
             layer.visible = bool(visible)
+            try:
+                state.viewer.layers.move(state.viewer.layers.index(layer), len(state.viewer.layers) - 1)
+            except Exception:
+                pass
         elif layer is not None:
             layer.data = np.empty((0, 4), dtype=float)
             layer.visible = False
@@ -455,12 +654,37 @@ def _build_dock(state: _State) -> Container:
     text_size = FloatSpinBox(value=state.text_size, step=1.0, min=6.0, max=64.0, label="Text size")
     edge_width = FloatSpinBox(value=state.edge_width, step=0.5, min=0.5, max=10.0, label="Edge width")
     event_size = FloatSpinBox(value=state.event_size, step=0.5, min=1.0, max=20.0, label="Event size")
+    edge_time_window = FloatSpinBox(value=float(state.edge_time_window), step=1.0, min=0.0, max=50.0, label="Edge time window (frames)")
+    focus_edges_only = CheckBox(text="Show focused track edges", value=state.filter_focus_edges)
+    btn_verify_mode = PushButton(text="Verify view")
+    btn_context_mode = PushButton(text="Context view")
+    btn_reset_filters = PushButton(text="Reset filters")
 
     show_cont = CheckBox(text="Show continuations", value=state.show_cont_edges)
     show_fission_edges = CheckBox(text="Show fission edges", value=state.show_fission_edges)
     show_fusion_edges = CheckBox(text="Show fusion edges", value=state.show_fusion_edges)
     show_fission_nodes = CheckBox(text="Show fission nodes", value=state.show_fission_nodes)
     show_fusion_nodes = CheckBox(text="Show fusion nodes", value=state.show_fusion_nodes)
+    local_filter = CheckBox(text="Local edge filter", value=state.local_filter_enabled)
+    local_radius = FloatSpinBox(
+        value=state.local_filter_radius_um if state.local_filter_radius_um > 0 else 8.0,
+        step=1.0,
+        min=0.0,
+        max=250.0,
+        label="Local radius (um)",
+    )
+    local_dt = FloatSpinBox(
+        value=state.local_filter_time_window,
+        step=1.0,
+        min=0.0,
+        max=20.0,
+        label="Local Δt (frames)",
+    )
+    state.local_filter_radius_um = float(local_radius.value)
+    try:
+        state.local_filter_time_window = int(float(local_dt.value))
+    except Exception:
+        state.local_filter_time_window = 0
 
     info = Label(value="IDs use labels.tif and objects.csv; edge overlays need edges_all.csv.")
 
@@ -479,6 +703,21 @@ def _build_dock(state: _State) -> Container:
     audit_action_row = Container(widgets=[focus_btn, clear_focus_btn], layout="horizontal")
     audit_nav_row = Container(widgets=[prev_track_btn, next_track_btn], layout="horizontal")
     track_info = Label(value="Track info: –")
+
+    review_header = Label(value="<b>Event review</b>")
+    btn_verify = PushButton(text="Mark Verified")
+    btn_question = PushButton(text="Mark Questionable")
+    btn_reject = PushButton(text="Mark Reject")
+    review_row = Container(widgets=[btn_verify, btn_question, btn_reject], layout="horizontal")
+    event_info = Label(value="Event: –")
+    btn_prev_event = PushButton(text="◀ Prev event")
+    btn_next_event = PushButton(text="Next event ▶")
+    toggle_only_event = CheckBox(text="Show only current event", value=False)
+    goto_label = Label(value="Go to (t, label):")
+    goto_t = FloatSpinBox(value=0, step=1, min=0, max=1e6)
+    goto_id = FloatSpinBox(value=0, step=1, min=0, max=1e6)
+    btn_goto = PushButton(text="Go")
+    goto_row = Container(widgets=[goto_label, goto_t, goto_id, btn_goto], layout="horizontal")
 
     def _refresh_track_choices() -> None:
         ids = [str(t) for t in state.track_ids if t > 0]
@@ -609,6 +848,74 @@ def _build_dock(state: _State) -> Container:
 
         if track_id not in state.audit_history:
             state.audit_history.append(track_id)
+        _refresh_edges(state)
+
+    def _update_event_info():
+        if state.event_rows is None or state.current_event_idx is None or state.current_event_idx < 0 or state.current_event_idx >= len(state.event_rows):
+            event_info.value = "Event: –"
+            return
+        row = state.event_rows.iloc[state.current_event_idx]
+        event_info.value = f"{row['edge_type']} t{int(row['t_from'])}->{int(row['t_to'])} p{int(row['parent_label'])}→c{int(row['child_label'])}"
+
+    def _goto_event(delta: int):
+        if state.event_rows is None or state.event_rows.empty:
+            return
+        idx = state.current_event_idx if state.current_event_idx is not None else 0
+        idx = (idx + delta) % len(state.event_rows)
+        state.current_event_idx = idx
+        row = state.event_rows.iloc[idx]
+        try:
+            state._last_selected_event_idx = int(row["_edge_index"])
+        except Exception:
+            state._last_selected_event_idx = None
+        _update_event_info()
+        try:
+            viewer.dims.set_current_step(0, int(row["t_to"]))
+            if "centroid_z_um" in state.objects_df.columns and "centroid_z_vox" in state.objects_df.columns:
+                pass
+        except Exception:
+            pass
+        _refresh_edges(state)
+
+    @btn_prev_event.changed.connect
+    def _on_prev_event(event=None):
+        _goto_event(-1)
+
+    @btn_next_event.changed.connect
+    def _on_next_event(event=None):
+        _goto_event(1)
+
+    @toggle_only_event.changed.connect
+    def _on_toggle_only_event(event=None):
+        state.show_only_event = bool(toggle_only_event.value)
+        _refresh_edges(state)
+
+    @btn_goto.changed.connect
+    def _on_goto(event=None):
+        try:
+            t_val = int(goto_t.value)
+            lbl_val = int(goto_id.value)
+        except Exception:
+            return
+        coord = state.lookup.get((t_val, lbl_val))
+        if coord is None:
+            return
+        try:
+            viewer.dims.set_current_step(0, int(coord[0]))
+            viewer.dims.set_current_step(1, int(round(coord[1])))
+            viewer.dims.set_current_step(2, int(round(coord[2])))
+            viewer.dims.set_current_step(3, int(round(coord[3])))
+        except Exception:
+            pass
+        # highlight object if track_id known
+        if state.points_layer is not None and state.points_table is not None:
+            mask = (state.points_table["t"] == t_val) & (state.points_table["label_id"] == lbl_val)
+            idxs = list(state.points_table[mask].index)
+            if idxs:
+                try:
+                    state.points_layer.selected_data = {int(idxs[0])}
+                except Exception:
+                    pass
 
     def _highlight_current(event=None) -> None:
         tid = _get_selected_track()
@@ -661,6 +968,7 @@ def _build_dock(state: _State) -> Container:
     def _on_color_by(event=None):
         state.color_key = "track_id" if color_by.value == "track" else "label_id"
         _update_color_map("track_id" if color_by.value == "track" else "label_id")
+        _refresh_edges(state)
 
     @point_size.changed.connect
     def _on_point_size(event=None):
@@ -686,11 +994,15 @@ def _build_dock(state: _State) -> Container:
         for layer in state.node_layers.values():
             if layer is not None:
                 layer.size = state.event_size
+        _refresh_edges(state)
 
     @show_cont.changed.connect
     def _toggle_cont(event=None):
         state.show_cont_edges = bool(show_cont.value)
         layer = state.edge_layers.get("continuations")
+        if layer is not None:
+            layer.visible = state.show_cont_edges
+        layer = state.edge_layers.get("gap")
         if layer is not None:
             layer.visible = state.show_cont_edges
 
@@ -721,6 +1033,157 @@ def _build_dock(state: _State) -> Container:
         layer = state.node_layers.get("fusion_nodes")
         if layer is not None:
             layer.visible = state.show_fusion_nodes
+
+    @edge_time_window.changed.connect
+    def _on_edge_time_window(event=None):
+        state.edge_time_window = int(edge_time_window.value)
+        _refresh_edges(state)
+
+    @focus_edges_only.changed.connect
+    def _on_focus_edges_only(event=None):
+        state.filter_focus_edges = bool(focus_edges_only.value)
+        _refresh_edges(state)
+
+    def _select_from_points_layer(event=None):
+        try:
+            selection = state.points_layer.selected_data
+            if not selection:
+                return
+            idx = list(selection)[0]
+            tid = state.props.get("track_id", [None])[idx]
+            if tid is not None and tid > 0:
+                _set_focus(int(tid))
+        except Exception:
+            pass
+
+    if state.points_layer is not None:
+        try:
+            state.points_layer.events.selected.connect(_select_from_points_layer)
+        except Exception:
+            pass
+
+    def _set_view_mode(verify: bool):
+        state.show_only_event = verify
+        toggle_only_event.value = verify
+        state.show_cont_edges = not verify
+        show_cont.value = not verify
+        state.edge_time_window = 0 if not verify else 0
+        edge_time_window.value = state.edge_time_window
+        focus_edges_only.value = False
+        state.filter_focus_edges = False
+        if state.labels_layer is not None:
+            try:
+                state.labels_layer.opacity = 0.3 if verify else 0.5
+            except Exception:
+                pass
+        base_image = _get_layer(viewer, "image") or _get_layer(viewer, "binary")
+        if base_image is not None:
+            try:
+                base_image.visible = not verify
+            except Exception:
+                pass
+        _refresh_edges(state)
+
+    @btn_verify_mode.changed.connect
+    def _on_verify_mode(event=None):
+        _set_view_mode(True)
+
+    @btn_context_mode.changed.connect
+    def _on_context_mode(event=None):
+        _set_view_mode(False)
+
+    @btn_reset_filters.changed.connect
+    def _on_reset(event=None):
+        state.local_filter_enabled = False
+        local_filter.value = False
+        state.local_filter_radius_um = float(local_radius.value)
+        state.local_filter_time_window = 0
+        local_dt.value = 0
+        state.edge_time_window = 0
+        edge_time_window.value = 0
+        state.filter_focus_edges = False
+        focus_edges_only.value = False
+        state.show_only_event = False
+        toggle_only_event.value = False
+        _refresh_edges(state)
+
+    def _current_event_row() -> Optional[pd.Series]:
+        if state.event_rows is not None and state.current_event_idx is not None:
+            if 0 <= state.current_event_idx < len(state.event_rows):
+                return state.event_rows.iloc[state.current_event_idx]
+        if state._last_selected_event_idx is None or state.edges_df is None or state.edges_df.empty:
+            return None
+        idx = state._last_selected_event_idx
+        if idx < 0 or idx >= len(state.edges_df):
+            return None
+        row = state.edges_df.iloc[idx]
+        if str(row.get("edge_type", "")).lower() not in ("fission", "fusion"):
+            return None
+        return row
+
+    def _write_review(status: str):
+        row = _current_event_row()
+        if row is None or state.verified_path is None:
+            return
+        record = {
+            "edge_type": row.get("edge_type"),
+            "t_from": row.get("t_from"),
+            "t_to": row.get("t_to"),
+            "parent_label": row.get("parent_label"),
+            "child_label": row.get("child_label"),
+            "parent_track_id": row.get("parent_track_id"),
+            "child_track_id": row.get("child_track_id"),
+            "status": status,
+        }
+        try:
+            if os.path.exists(state.verified_path):
+                df = pd.read_csv(state.verified_path)
+                # drop duplicates for same key
+                df = df[~((df["edge_type"] == record["edge_type"]) &
+                          (df["t_from"] == record["t_from"]) &
+                          (df["t_to"] == record["t_to"]) &
+                          (df["parent_label"] == record["parent_label"]) &
+                          (df["child_label"] == record["child_label"]))]
+                df = pd.concat([df, pd.DataFrame([record])], ignore_index=True)
+            else:
+                df = pd.DataFrame([record])
+            df.to_csv(state.verified_path, index=False)
+            print(f"Wrote review: {status} -> {state.verified_path}")
+        except Exception as exc:
+            print(f"Failed to write review: {exc}", file=sys.stderr)
+
+    @btn_verify.changed.connect
+    def _on_verify(event=None):
+        _write_review("verified")
+        _goto_event(1)
+
+    @btn_question.changed.connect
+    def _on_question(event=None):
+        _write_review("questionable")
+        _goto_event(1)
+
+    @btn_reject.changed.connect
+    def _on_reject(event=None):
+        _write_review("reject")
+        _goto_event(1)
+
+    @local_filter.changed.connect
+    def _toggle_local_filter(event=None):
+        state.local_filter_enabled = bool(local_filter.value)
+        _refresh_edges(state)
+
+    @local_radius.changed.connect
+    def _update_local_radius(event=None):
+        state.local_filter_radius_um = float(local_radius.value)
+        _refresh_edges(state)
+
+    @local_dt.changed.connect
+    def _update_local_dt(event=None):
+        try:
+            state.local_filter_time_window = int(float(local_dt.value))
+        except Exception:
+            state.local_filter_time_window = 0
+        _refresh_edges(state)
 
     @reload_btn.changed.connect
     def _on_reload(event=None):
@@ -796,6 +1259,18 @@ def _build_dock(state: _State) -> Container:
             if edge_path and os.path.exists(edge_path):
                 state.edges_df = pd.read_csv(edge_path)
                 state.edges_path = edge_path
+                if not state.edges_df.empty:
+                    ev = state.edges_df[state.edges_df["edge_type"].isin(["fission","fusion"])].copy()
+                    ev["_edge_index"] = ev.index
+                    ev = ev.reset_index(drop=True)
+                    state.event_rows = ev
+                    state.current_event_idx = 0 if len(ev) else None
+                    state._last_selected_event_idx = int(ev["_edge_index"].iloc[0]) if len(ev) else None
+                    _update_event_info()
+                else:
+                    state.event_rows = None
+                    state.current_event_idx = None
+                    state._last_selected_event_idx = None
             _refresh_edges(state)
             if previous_focus is not None and previous_focus in state.track_ids:
                 _set_focus(previous_focus)
@@ -818,19 +1293,72 @@ def _build_dock(state: _State) -> Container:
         text_size,
         edge_width,
         event_size,
+        edge_time_window,
+        focus_edges_only,
+        btn_reset_filters,
+        btn_verify_mode,
+        btn_context_mode,
         show_cont,
         show_fission_edges,
         show_fusion_edges,
         show_fission_nodes,
         show_fusion_nodes,
+        local_filter,
+        local_radius,
+        local_dt,
         audit_header,
         track_combo,
         audit_action_row,
         audit_nav_row,
         track_info,
+        review_header,
+        review_row,
+        event_info,
+        btn_prev_event,
+        btn_next_event,
+        toggle_only_event,
+        goto_row,
     ]
     container = Container(widgets=widgets, labels=False, layout="vertical")
     viewer.window.add_dock_widget(container, name="Mito controls", area="right")
+    try:
+        viewer.dims.events.current_step.connect(lambda event=None: _refresh_edges(state))
+    except Exception:
+        pass
+    # optional event selection callbacks for node layers
+    def _select_from_nodes():
+        def _make_handler(idx_list_key: str, layer_key: str):
+            layer = state.node_layers.get(layer_key)
+            if layer is None:
+                return None
+            def _on_select(event=None):
+                try:
+                    sel = layer.selected_data
+                    if not sel:
+                        return
+                    sel_idx = list(sel)[0]
+                    indices = state._geom_indices.get(idx_list_key, [])
+                    if sel_idx < len(indices):
+                        idx_val = indices[sel_idx]
+                        state._last_selected_event_idx = idx_val
+                        if state.event_rows is not None and "_edge_index" in state.event_rows:
+                            match = state.event_rows[state.event_rows["_edge_index"] == idx_val]
+                            if not match.empty:
+                                state.current_event_idx = int(match.index[0])
+                                _update_event_info()
+                                _refresh_edges(state)
+                except Exception:
+                    pass
+            return _on_select
+        for key, idx_key in (("fission_nodes","fission_idx"), ("fusion_nodes","fusion_idx")):
+            handler = _make_handler(idx_key, key)
+            if handler:
+                try:
+                    state.node_layers[key].events.selected.connect(handler)
+                except Exception:
+                    pass
+    _select_from_nodes()
+    _update_event_info()
     return container
 
 
@@ -862,7 +1390,15 @@ def main() -> None:
     ap.add_argument("--text-size", type=float, default=16.0)
     ap.add_argument("--edge-width", type=float, default=2.0)
     ap.add_argument("--event-size", type=float, default=6.0)
+    ap.add_argument("--local-edge-filter", action="store_true", help="Enable local density filter around the current cursor/time step for edges/nodes.")
+    ap.add_argument("--local-edge-radius-um", type=float, default=0.0, help="Radius (microns) for the local edge filter.")
+    ap.add_argument("--local-edge-dt", type=int, default=0, help="Half-window in frames for the local edge filter.")
     args = ap.parse_args()
+
+    voxel_size = tuple(args.voxel_size_um) if args.voxel_size_um else None
+    if voxel_size and any((not np.isfinite(v)) or (v <= 0) for v in voxel_size):
+        print("Warning: voxel-size must be positive; falling back to voxel coordinates in overlays.", file=sys.stderr)
+        voxel_size = None
 
     outdir = args.outdir or args.discover
     if outdir:
@@ -889,12 +1425,26 @@ def main() -> None:
         print("ERROR: need at least --objects or --labels to visualize.", file=sys.stderr)
         sys.exit(2)
 
+    def _load_stack(path: str) -> np.ndarray:
+        arr = imread(path)
+        if arr.ndim < 3 or arr.ndim > 5:
+            raise ValueError(f"Expected 3D/4D stack (optionally with channel), got shape {arr.shape} for {path}")
+        return to_tzyx(arr, args.axis)
+
     img_arr = None
     lab_arr = None
     if args.image and os.path.exists(args.image):
-        img_arr = to_tzyx(imread(args.image), args.axis)
+        try:
+            img_arr = _load_stack(args.image)
+        except Exception as exc:
+            print(f"ERROR loading image '{args.image}': {exc}", file=sys.stderr)
+            sys.exit(2)
     if args.labels and os.path.exists(args.labels):
-        lab_arr = to_tzyx(imread(args.labels), args.axis)
+        try:
+            lab_arr = _load_stack(args.labels)
+        except Exception as exc:
+            print(f"ERROR loading labels '{args.labels}': {exc}", file=sys.stderr)
+            sys.exit(2)
 
     props = {"label_id": [], "track_id": []}
     lookup: Dict[Tuple[int, int], np.ndarray] = {}
@@ -914,7 +1464,7 @@ def main() -> None:
                 args.col_y,
                 args.col_x,
                 args.col_z,
-                tuple(args.voxel_size_um) if args.voxel_size_um else None,
+                voxel_size,
             )
         except Exception as exc:
             print(f"Failed to interpret objects table: {exc}", file=sys.stderr)
@@ -961,9 +1511,17 @@ def main() -> None:
     except Exception:
         pass
     if img_arr is not None:
-        viewer.add_image(img_arr, name="image", blending="additive")
+        img_layer = viewer.add_image(img_arr, name="image", blending="additive", opacity=0.3)
+        try:
+            viewer.layers.move(viewer.layers.index(img_layer), 0)
+        except Exception:
+            pass
     if lab_arr is not None:
-        viewer.add_labels(lab_arr, name="labels", opacity=0.4)
+        lbl_layer = viewer.add_labels(lab_arr, name="labels", opacity=0.4)
+        try:
+            viewer.layers.move(viewer.layers.index(lbl_layer), 1)
+        except Exception:
+            pass
 
     points_layer = None
     if len(points):
@@ -992,6 +1550,12 @@ def main() -> None:
             _apply_text(points_layer, props, "track_id" if args.color_by == "track" else "label_id", True, args.text_size)
 
     edges_df = pd.read_csv(args.edges) if args.edges and os.path.exists(args.edges) else None
+    events_df = None
+    if edges_df is not None and not edges_df.empty:
+        events_df = edges_df[edges_df["edge_type"].isin(["fission","fusion"])].copy()
+    verified_path = None
+    if args.edges:
+        verified_path = os.path.join(os.path.dirname(os.path.abspath(args.edges)), "events_verified.csv")
 
     state = _State(
         viewer=viewer,
@@ -1006,9 +1570,16 @@ def main() -> None:
         objects_path=args.objects,
         edges_path=args.edges,
         edges_df=edges_df,
+        events_df=events_df,
         text_size=args.text_size,
         event_size=args.event_size,
         edge_width=args.edge_width,
+        local_filter_enabled=bool(args.local_edge_filter),
+        local_filter_radius_um=float(args.local_edge_radius_um),
+        local_filter_time_window=int(args.local_edge_dt),
+        edge_time_window=0,
+        filter_focus_edges=False,
+        verified_path=verified_path,
         show_cont_edges=True,
         show_fission_edges=True,
         show_fusion_edges=True,
@@ -1020,13 +1591,23 @@ def main() -> None:
         col_y=args.col_y,
         col_x=args.col_x,
         col_z=args.col_z,
-        voxel_size_um=tuple(args.voxel_size_um) if args.voxel_size_um else None,
+        voxel_size_um=voxel_size,
         show_ids_default=bool(args.show_ids),
         objects_df=objects_df,
         points_table=table,
         track_ids=track_ids,
         label_ids=label_ids,
     )
+    state._last_selected_event_idx = None
+    state._geom_indices = {}
+    if events_df is not None and not events_df.empty:
+        ev = events_df.copy()
+        ev["_edge_index"] = ev.index
+        ev = ev.reset_index(drop=True)
+        state.event_rows = ev
+        state.current_event_idx = 0 if len(ev) else None
+    else:
+        state.event_rows = None
 
     _refresh_edges(state)
     _build_dock(state)
