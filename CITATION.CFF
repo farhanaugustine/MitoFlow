@@ -1,0 +1,53 @@
+cff-version: 1.2.0
+message: "If you use MitoFlow in your research, please cite it as below."
+title: "MitoFlow: Mitochondrial Fission and Fusion Detection in 4D Microscopy"
+type: software
+
+authors:
+  - family-names: Augustine
+    given-names: Farhan
+    orcid: "https://orcid.org/0000-0002-8348-6039"
+
+abstract: >
+  MitoFlow is a Python-based pipeline for detecting and quantifying mitochondrial
+  fission and fusion events in 4D confocal microscopy data. Starting from
+  binarized mitochondrial masks, MitoFlow performs 3D
+  segmentation, multi-criteria tracking, and event calling to build full
+  mitochondrial lineages over time. For each timepoint, individual mitochondria
+  are labeled in 3D via connected-component analysis (6-connected components, default) and annotated with volume,
+  physical centroid coordinates, and sphere radius. Across
+  consecutive frames, candidate parent–child links are proposed based on voxel
+  overlap and centroid proximity (KD-tree search) and scored with a composite
+  cost function that combines overlap (IoU), distance, and relative volume
+  change, followed by Hungarian matching to obtain consistent tracks. Fission
+  and fusion events are detected from one-to-many and many-to-one transitions
+  that satisfy overlap and volume-conservation criteria, and are filtered by a
+  persistence requirement (default 1-frame). The pipeline exports a directed lineage graph,
+  rich tabular outputs, and voxel-wise label/track volumes, and provides
+  Napari and HTML-report interfaces for interactive quality control and
+  figure-ready visualizations.
+
+keywords:
+  - mitochondria
+  - mitochondrial dynamics
+  - fission
+  - fusion
+  - confocal microscopy
+  - 4D imaging
+  - tracking
+  - lineage
+  - Python
+
+repository-code: "https://github.com/farhanaugustine/MitoFlow"
+version: "0.0.1"
+date-released: "2025-11-25"
+
+preferred-citation:
+  type: software
+  title: "MitoFlow: Mitochondrial Fission and Fusion Detection in 4D Microscopy"
+  authors:
+    - family-names: Augustine
+      given-names: Farhan
+      orcid: "https://orcid.org/0000-0002-8348-6039"
+  version: "0.0.1"
+  date-released: "2025-11-25"
