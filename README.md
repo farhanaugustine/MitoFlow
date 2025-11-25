@@ -1,6 +1,9 @@
 # Mitochondria 4D Tracking Toolkit
 
 Point-and-click and command-line tools for tracking mitochondria in 4D (t,z,y,x) binary stacks, detecting **fission/fusion** events, visualizing in **Napari**, and generating a **no-code HTML report**.
+Simply binarize your 4D hyperstacks in ImageJ/FIJI --> save as tiffs --> run MitoFlow to detect fission/fusion events.
+
+Repo still under development. API may evolve as the project gains more advanced feature. 🚧🚩
 
 ## Contents
 - `mito_gui_fixed.py` - Tkinter GUI wrapper (Windows-safe) for end users.
