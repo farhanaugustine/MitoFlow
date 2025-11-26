@@ -1,3 +1,4 @@
+[![DOI](https://zenodo.org/badge/1076523116.svg)](https://doi.org/10.5281/zenodo.17717238)
 # Mitochondria 4D Tracking Toolkit
 
 Point-and-click and command-line tools for tracking mitochondria in 4D (t,z,y,x) binary stacks, detecting **fission/fusion** events, visualizing in **Napari**, and generating a **no-code HTML report**.
